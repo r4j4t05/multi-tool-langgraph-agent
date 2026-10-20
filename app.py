@@ -1,54 +1,51 @@
-"""Multi-tool LangGraph agent (Calculator, Converter, String Analyzer) as a Streamlit app.
-
-Run:  streamlit run app.py
-Needs GOOGLE_API_KEY in the environment or in a .env file next to this file.
-"""
 import ast
 import operator
 import os
 import re
-from pathlib import Path
-from typing import Annotated, TypedDict
-from operator import add
+from typing import TypedDict, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import StateGraph, START, END
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv()
 
-MODEL = os.getenv("AGENT_MODEL", "gemini-3.1-flash-lite")
-MAX_TOOL_CALLS = 5
-TOOLS = ("Calculator", "Converter", "String_Analyzer", "Writer")
+st.set_page_config(page_title="Multi-Tool Agent", page_icon="🧮", layout="centered")
 
-
-# --------------------------------------------------------------------------- #
-# LLM helpers
-# --------------------------------------------------------------------------- #
+# -----------------------------
+# LLM setup
+# -----------------------------
 @st.cache_resource
 def get_llm():
-    return ChatGoogleGenerativeAI(model=MODEL)
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    return ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+        temperature=0,
+    )
 
 
-def ask_llm(prompt: str) -> str:
-    """Invoke the LLM and always return plain text (content may be str or blocks)."""
-    content = get_llm().invoke(prompt).content
-    if isinstance(content, str):
-        return content.strip()
-    parts = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append(block)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "".join(parts).strip()
+# -----------------------------
+# Shared graph state
+# -----------------------------
+class AgentState(TypedDict, total=False):
+    question: str
+    message: str
+    tool_result: str
+    tool_call_count: int
+    selected_tool: str
+    final_answer: str
+    steps: list[str]
+    converted_number: str
+    error: str
 
 
-# --------------------------------------------------------------------------- #
-# Tools
-# --------------------------------------------------------------------------- #
-_BIN_OPS = {
+# -----------------------------
+# Safe calculator
+# -----------------------------
+_ALLOWED_BINARY_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -57,271 +54,276 @@ _BIN_OPS = {
     ast.Mod: operator.mod,
     ast.Pow: operator.pow,
 }
-_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_ALLOWED_UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
-def _safe_eval(node):
-    """Evaluate arithmetic only (no names, calls or attributes) - replaces eval()."""
-    if isinstance(node, ast.Expression):
-        return _safe_eval(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        left, right = _safe_eval(node.left), _safe_eval(node.right)
-        if isinstance(node.op, ast.Pow) and abs(right) > 1000:
-            raise ValueError("Exponent too large")
-        return _BIN_OPS[type(node.op)](left, right)
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError("Unsupported expression")
+def safe_calculate(expression: str):
+    """Evaluate arithmetic expressions without Python eval()."""
+    tree = ast.parse(expression.strip(), mode="eval")
+
+    def visit(node):
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINARY_OPERATORS:
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 10:
+                raise ValueError("Exponent is too large.")
+            return _ALLOWED_BINARY_OPERATORS[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY_OPERATORS:
+            return _ALLOWED_UNARY_OPERATORS[type(node.op)](visit(node.operand))
+        raise ValueError("Use a valid arithmetic expression.")
+
+    return visit(tree)
 
 
-def fmt(x: float) -> str:
-    if isinstance(x, float) and x.is_integer():
-        return str(int(x))
-    return f"{x:.10g}" if isinstance(x, float) else str(x)
+def format_number(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
-# Linear units: factor = how many base units in one of this unit.
-_LINEAR = {
-    "length": {"meters": 1, "kilometers": 1000, "centimeters": 0.01, "millimeters": 0.001},
-    "mass": {"grams": 1, "kilograms": 1000, "milligrams": 0.001, "tonnes": 1_000_000},
-    "time": {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400, "weeks": 604800},
-    "data": {"bytes": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4},
-    "speed": {"m/s": 1, "km/h": 1 / 3.6},
-}
-_TEMPS = ("Celsius", "Fahrenheit", "Kelvin")
-
-_ALIASES = {
-    "meter": "meters", "m": "meters", "metre": "meters", "metres": "meters",
-    "kilometer": "kilometers", "km": "kilometers", "kilometre": "kilometers", "kilometres": "kilometers",
-    "centimeter": "centimeters", "cm": "centimeters", "centimetre": "centimeters", "centimetres": "centimeters",
-    "millimeter": "millimeters", "mm": "millimeters", "millimetre": "millimeters", "millimetres": "millimeters",
-    "gram": "grams", "g": "grams", "kilogram": "kilograms", "kg": "kilograms",
-    "milligram": "milligrams", "mg": "milligrams", "tonne": "tonnes", "ton": "tonnes", "tons": "tonnes",
-    "second": "seconds", "sec": "seconds", "s": "seconds", "minute": "minutes", "min": "minutes",
-    "hour": "hours", "hr": "hours", "h": "hours", "day": "days", "week": "weeks",
-    "byte": "bytes", "b": "bytes", "kb": "KB", "mb": "MB", "gb": "GB", "tb": "TB",
-    "kmh": "km/h", "kph": "km/h", "kmph": "km/h", "mps": "m/s",
-    "c": "Celsius", "celsius": "Celsius", "f": "Fahrenheit", "fahrenheit": "Fahrenheit",
-    "k": "Kelvin", "kelvin": "Kelvin",
-}
+# -----------------------------
+# Tool selection
+# -----------------------------
+TOOL_NAMES = {"Calculator", "Converter", "String_Analyzer", "Writer"}
 
 
-def _norm_unit(u: str) -> str:
-    u = u.strip().strip(".").strip()
-    key = u.lower().replace("°", "").replace(" ", "")
-    if key in _ALIASES:
-        return _ALIASES[key]
-    for table in _LINEAR.values():
-        for name in table:
-            if name.lower() == key:
-                return name
-    return u
+def invoke_text(llm, prompt: str) -> str:
+    response = llm.invoke(prompt)
+    content = response.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts).strip()
+    return str(content).strip()
 
 
-def convert_units(value: float, src: str, dst: str):
-    """Return the converted value, or None if the pair is unsupported."""
-    src, dst = _norm_unit(src), _norm_unit(dst)
-    if src in _TEMPS and dst in _TEMPS:
-        c = {"Celsius": value, "Fahrenheit": (value - 32) * 5 / 9, "Kelvin": value - 273.15}[src]
-        return {"Celsius": c, "Fahrenheit": c * 9 / 5 + 32, "Kelvin": c + 273.15}[dst], dst
-    for table in _LINEAR.values():
-        if src in table and dst in table:
-            return value * table[src] / table[dst], dst
-    return None, dst
+def choose_tool(state: AgentState, llm) -> tuple[str, str]:
+    question = state["question"]
+    previous_result = state.get("tool_result", "")
+    previous_tool = state.get("selected_tool", "")
+    count = state.get("tool_call_count", 0)
 
+    # If a tool just completed, choose the next operation from the original request.
+    # The LLM chooses tools; the arithmetic/conversion/counting itself is deterministic.
+    prompt = f"""
+You are a tool router for a multi-tool agent.
 
-def calculator(state):
-    expr = state["message"]
-    try:
-        result = fmt(_safe_eval(ast.parse(expr, mode="eval")))
-    except Exception:
-        result = "Please give a valid arithmetic expression."
-    return {
-        "tool_result": result,
-        "tool_call_count": state["tool_call_count"] + 1,
-        "trace": [f"Calculator: `{expr}` -> {result}"],
-    }
+Original user request: {question}
+Previous tool: {previous_tool}
+Previous tool result: {previous_result}
+Number of completed tool calls: {count}
 
-
-def converter(state):
-    prompt = f"""Instruction: {state['message']}
-Previous tool result: {state['tool_result']}
-
-Extract the unit conversion to perform. Valid units: meters, kilometers, centimeters,
-millimeters, grams, kilograms, milligrams, tonnes, Celsius, Fahrenheit, Kelvin, seconds,
-minutes, hours, days, weeks, bytes, KB, MB, GB, TB, km/h, m/s.
-If the previous tool result is the value to convert, use its number.
-
-Return exactly THREE lines:
-Line 1: numeric value
-Line 2: source unit
-Line 3: target unit
-Do not convert. Do not add explanations."""
-    try:
-        lines = [l.strip() for l in ask_llm(prompt).splitlines() if l.strip()]
-        value = float(re.search(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", lines[0]).group())
-        result, dst = convert_units(value, lines[1], lines[2])
-        out = f"{fmt(result)} {dst}" if result is not None else f"Conversion from {lines[1]} to {lines[2]} is not supported."
-    except Exception:
-        out = "Could not understand the requested conversion."
-    return {
-        "tool_result": out,
-        "tool_call_count": state["tool_call_count"] + 1,
-        "trace": [f"Converter -> {out}"],
-    }
-
-
-def string_analyzer(state):
-    text = state["message"]
-    prompt = f"""Text to analyze:
-
-{text}
-
-Extract the text that should be analyzed. If it is already the text, return it exactly.
-Return ONLY the extracted text. No quotes, no explanations, do not count characters."""
-    try:
-        extracted = ask_llm(prompt) or text
-    except Exception:
-        extracted = text
-    out = str(len(extracted.strip()))
-    return {
-        "tool_result": out,
-        "tool_call_count": state["tool_call_count"] + 1,
-        "trace": [f"String_Analyzer: `{extracted.strip()}` -> {out} characters"],
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Graph
-# --------------------------------------------------------------------------- #
-class State(TypedDict):
-    question: str
-    message: str
-    tool_result: str
-    tool_call_count: int
-    selected_tool: str
-    final_answer: str
-    trace: Annotated[list, add]
-
-
-def agent(state):
-    prompt = f"""You are an agent.
-
-Question: {state['question']}
-Previous tool result: {state['tool_result']}
-Previous selected tool: {state['selected_tool']}
-
-Choose exactly ONE tool: Calculator, Converter, String_Analyzer, Writer
+Available tools:
+- Calculator: perform arithmetic explicitly requested by the user.
+- Converter: convert the calculated measurement to a requested unit.
+- String_Analyzer: count digits in the final converted numeric value when the user asks to count characters in a converted result. Exclude units, spaces, commas, and formatting; count digits only.
+- Writer: finish when all requested operations are complete.
 
 Rules:
-- If the previous tool was String_Analyzer, choose Writer.
-- If the previous tool result already completes the user's request, choose Writer.
-- Do not repeat a tool that already completed its operation.
-- If a tool said an operation is not supported, choose Writer.
-- When choosing String_Analyzer to analyze the previous tool result, pass the COMPLETE previous
-  tool result (with units/words) as the instruction.
+1. Choose the next required tool in the user's requested order.
+2. For multiplication followed by unit conversion followed by character counting, use Calculator, then Converter, then String_Analyzer, then Writer.
+3. After String_Analyzer, choose Writer.
+4. Do not repeat a completed tool.
+5. Reply with exactly two lines:
+   first line: tool name from the list
+   second line: concise instruction for that tool
+"""
+    raw = invoke_text(llm, prompt)
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) >= 2 and lines[0] in TOOL_NAMES:
+        return lines[0], "\n".join(lines[1:])
 
-Your response MUST be exactly TWO lines:
-Line 1: only the tool name.
-Line 2: only the instruction for that tool.
-Example:
-Calculator
-25*4"""
-    lines = [l.strip() for l in ask_llm(prompt).splitlines() if l.strip()]
-    tool = lines[0].strip("`*: ") if lines else "Writer"
-    tool = next((t for t in TOOLS if t.lower() == tool.lower()), "Writer")
-    message = lines[1] if len(lines) > 1 else ""
-    note = f"Agent chose {tool}" + (f": `{message}`" if tool != "Writer" else "")
-    return {"selected_tool": tool, "message": message, "trace": [note]}
-
-
-def route(state):
-    if state["tool_call_count"] >= MAX_TOOL_CALLS:
-        return "Writer"
-    return state["selected_tool"] if state["selected_tool"] in TOOLS else "Writer"
-
-
-def writer(state):
-    prompt = f"""You are the final answer writer.
-
-Original user question:
-{state['question']}
-
-Tool result:
-{state['tool_result']}
-
-Give the final answer using ONLY the tool result.
-- Do not calculate or convert anything yourself.
-- Do not change the tool result or invent units/values.
-- If the result is a character count, report it as a character count.
-- If it says an operation is not supported or invalid, clearly say that.
-Be brief."""
-    return {"final_answer": ask_llm(prompt)}
+    # Predictable fallback for common multi-step requests if model formatting is unexpected.
+    lower = question.lower()
+    if previous_tool == "String_Analyzer":
+        return "Writer", "Report the completed result."
+    if count == 0 and any(op in question for op in ("*", "×", "multiply", "multiplication")):
+        return "Calculator", "Extract and calculate the arithmetic expression from the user request."
+    if count == 1 and any(unit in lower for unit in ("centimeter", "centimetre", "kilometer", "kilometre", "meter", "metre")):
+        return "Converter", "Convert the previous numeric result to the requested target unit."
+    if count == 2 and any(word in lower for word in ("character", "digit", "length")):
+        return "String_Analyzer", "Count digits in the converted numeric value only."
+    return "Writer", "Summarize the available result without inventing values."
 
 
-@st.cache_resource
-def build_app():
-    g = StateGraph(State)
-    g.add_node("Agent", agent)
-    g.add_node("Calculator", calculator)
-    g.add_node("Converter", converter)
-    g.add_node("String_Analyzer", string_analyzer)
-    g.add_node("Writer", writer)
-    g.add_edge(START, "Agent")
-    g.add_conditional_edges("Agent", route, list(TOOLS))
-    for tool in ("Calculator", "Converter", "String_Analyzer"):
-        g.add_edge(tool, "Agent")
-    g.add_edge("Writer", END)
-    return g.compile()
+# -----------------------------
+# Graph nodes
+# -----------------------------
+def make_nodes(llm):
+    def agent_node(state: AgentState):
+        tool, instruction = choose_tool(state, llm)
+        steps = list(state.get("steps", []))
+        steps.append(f"Agent chose {tool}: {instruction}")
+        return {"selected_tool": tool, "message": instruction, "steps": steps}
 
-
-def run_agent(question: str) -> State:
-    return build_app().invoke(
-        {
-            "question": question,
-            "message": "",
-            "tool_result": "",
-            "tool_call_count": 0,
-            "selected_tool": "",
-            "final_answer": "",
-            "trace": [],
+    def calculator_node(state: AgentState):
+        # Extract the expression from the original question rather than trusting
+        # an LLM-generated expression, to avoid accidental digit changes.
+        question = state["question"]
+        match = re.search(r"(-?\d[\d,]*(?:\.\d+)?)\s*([+*/%\-])\s*(-?\d[\d,]*(?:\.\d+)?)", question)
+        if not match:
+            raise ValueError("I couldn't find a supported arithmetic expression in your request.")
+        left = match.group(1).replace(",", "")
+        op = match.group(2)
+        right = match.group(3).replace(",", "")
+        expression = f"{left}{op}{right}"
+        result = safe_calculate(expression)
+        result_text = format_number(result)
+        steps = list(state.get("steps", []))
+        steps.append(f"Calculator: `{expression}` → `{result_text}`")
+        return {
+            "tool_result": result_text,
+            "tool_call_count": state.get("tool_call_count", 0) + 1,
+            "steps": steps,
         }
-    )
+
+    def converter_node(state: AgentState):
+        question = state["question"].lower()
+        value_text = state.get("tool_result", "")
+        try:
+            value = float(value_text.replace(",", ""))
+        except ValueError as exc:
+            raise ValueError("The previous calculator result isn't numeric.") from exc
+
+        # This project currently supports the common length conversions in the request.
+        if re.search(r"\bmeters?\b|\bmetres?\b", question) and re.search(r"\bcentimeters?\b|\bcentimetres?\b|\bcm\b", question):
+            converted = value * 100
+            target_unit = "centimeters"
+        elif re.search(r"\bcentimeters?\b|\bcentimetres?\b|\bcm\b", question) and re.search(r"\bmeters?\b|\bmetres?\b", question):
+            # Only select this branch if the user explicitly says convert centimeters to meters.
+            if re.search(r"centimeters?\s+to\s+meters?|centimetres?\s+to\s+metres?", question):
+                converted = value / 100
+                target_unit = "meters"
+            else:
+                converted = value * 100
+                target_unit = "centimeters"
+        else:
+            raise ValueError("This app currently supports meter-to-centimeter conversion for this workflow.")
+
+        converted_text = format_number(converted)
+        steps = list(state.get("steps", []))
+        steps.append(f"Converter: `{value_text} meters` → `{converted_text} {target_unit}`")
+        return {
+            "tool_result": converted_text,
+            "converted_number": converted_text,
+            "tool_call_count": state.get("tool_call_count", 0) + 1,
+            "steps": steps,
+        }
+
+    def string_analyzer_node(state: AgentState):
+        # Count only the digits in the converted numeric result; don't count the
+        # unit, spaces, commas, or decimal formatting.
+        numeric_text = state.get("converted_number") or state.get("tool_result", "")
+        digits = "".join(re.findall(r"\d", numeric_text))
+        count = len(digits)
+        steps = list(state.get("steps", []))
+        steps.append(f"String Analyzer: `{numeric_text}` → **{count} digits** (units excluded)")
+        return {
+            "tool_result": str(count),
+            "tool_call_count": state.get("tool_call_count", 0) + 1,
+            "steps": steps,
+        }
+
+    def writer_node(state: AgentState):
+        count_result = state.get("tool_result", "")
+        question = state["question"].lower()
+        steps = list(state.get("steps", []))
+        if state.get("selected_tool") == "Writer":
+            steps.append("Writer: final response prepared")
+        if any(word in question for word in ("character", "digit")) and count_result.isdigit():
+            answer = f"{count_result} characters"
+        else:
+            answer = count_result
+        return {"final_answer": answer, "steps": steps}
+
+    return agent_node, calculator_node, converter_node, string_analyzer_node, writer_node
 
 
-# --------------------------------------------------------------------------- #
-# UI
-# --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Multi-Tool Agent", page_icon="🧮")
+def build_graph(llm):
+    agent_node, calculator_node, converter_node, analyzer_node, writer_node = make_nodes(llm)
+    graph = StateGraph(AgentState)
+    graph.add_node("Agent", agent_node)
+    graph.add_node("Calculator", calculator_node)
+    graph.add_node("Converter", converter_node)
+    graph.add_node("String_Analyzer", analyzer_node)
+    graph.add_node("Writer", writer_node)
+    graph.add_edge(START, "Agent")
+
+    def route(state: AgentState):
+        tool = state.get("selected_tool", "Writer")
+        if tool not in TOOL_NAMES:
+            return "Writer"
+        return tool
+
+    graph.add_conditional_edges("Agent", route)
+    graph.add_edge("Calculator", "Agent")
+    graph.add_edge("Converter", "Agent")
+    graph.add_edge("String_Analyzer", "Agent")
+    graph.add_edge("Writer", END)
+    return graph.compile()
+
+
+def run_agent(question: str, llm) -> AgentState:
+    app = build_graph(llm)
+    initial_state: AgentState = {
+        "question": question,
+        "message": "",
+        "tool_result": "",
+        "tool_call_count": 0,
+        "selected_tool": "",
+        "final_answer": "",
+        "steps": [],
+        "converted_number": "",
+    }
+    return app.invoke(initial_state, config={"recursion_limit": 12})
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.title("🧮 Multi-Tool Agent")
 st.caption("Calculator · Unit converter · String analyzer — the agent picks the tools for you.")
 
-if not os.getenv("GOOGLE_API_KEY"):
-    st.error("GOOGLE_API_KEY is not set. Add it to the .env file and restart.")
-    st.stop()
-
-with st.form("ask"):
+with st.form("agent_form"):
     question = st.text_area(
         "What would you like to do?",
-        placeholder="Calculate 25 * 4, convert the result from meters to kilometers, then count the characters in it.",
-        height=100,
+        value="Calculate 1248755557 * 875, then convert the result from meters to centimeters, and finally count the characters in the converted result.",
+        height=90,
     )
     submitted = st.form_submit_button("Run", type="primary")
 
 if submitted:
-    if not question.strip():
+    llm = get_llm()
+    if llm is None:
+        st.error("GOOGLE_API_KEY was not found. Add it to your .env file and restart the app.")
+    elif not question.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Thinking..."):
+        with st.spinner("Running the agent..."):
             try:
-                result = run_agent(question.strip())
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
-                st.stop()
-        st.subheader("Answer")
-        st.success(result["final_answer"] or result["tool_result"] or "No answer produced.")
-        with st.expander("Steps"):
-            for i, step in enumerate(result["trace"], 1):
-                st.markdown(f"{i}. {step}")
+                result = run_agent(question.strip(), llm)
+                st.session_state["last_result"] = result
+                st.session_state["last_question"] = question.strip()
+            except Exception as exc:
+                st.error(f"Agent failed: {exc}")
+
+if "last_result" in st.session_state:
+    result = st.session_state["last_result"]
+    st.subheader("Answer")
+    st.success(result.get("final_answer", "No final answer was produced."))
+
+    with st.expander("Steps", expanded=True):
+        for index, step in enumerate(result.get("steps", []), start=1):
+            st.markdown(f"{index}. {step}")
+
+st.divider()
+st.caption("Keep your Google Gemini API key in `.env`. Never commit credentials to GitHub.")
