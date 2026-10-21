@@ -106,53 +106,30 @@ def invoke_text(llm, prompt: str) -> str:
     return str(content).strip()
 
 
-def choose_tool(state: AgentState, llm) -> tuple[str, str]:
-    question = state["question"]
-    previous_result = state.get("tool_result", "")
-    previous_tool = state.get("selected_tool", "")
+def choose_tool(state: AgentState, llm=None) -> tuple[str, str]:
+    """Deterministic routing prevents the LLM from repeatedly selecting a tool."""
+    question = state["question"].lower()
+    original_question = state["question"]
     count = state.get("tool_call_count", 0)
 
-    # If a tool just completed, choose the next operation from the original request.
-    # The LLM chooses tools; the arithmetic/conversion/counting itself is deterministic.
-    prompt = f"""
-You are a tool router for a multi-tool agent.
+    expression_pattern = (
+        r"(?<![\w.])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+        r"(?:\s*[+*/%\-]\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)+"
+    )
+    has_arithmetic = bool(re.search(expression_pattern, original_question))
+    asks_conversion = any(
+        unit in question
+        for unit in ("convert", "centimeter", "centimetre", "meter", "metre", " cm ")
+    )
+    asks_count = any(word in question for word in ("character", "digit", "count", "length"))
 
-Original user request: {question}
-Previous tool: {previous_tool}
-Previous tool result: {previous_result}
-Number of completed tool calls: {count}
-
-Available tools:
-- Calculator: perform arithmetic explicitly requested by the user.
-- Converter: convert the calculated measurement to a requested unit.
-- String_Analyzer: count digits in the final converted numeric value when the user asks to count characters in a converted result. Exclude units, spaces, commas, and formatting; count digits only.
-- Writer: finish when all requested operations are complete.
-
-Rules:
-1. Choose the next required tool in the user's requested order.
-2. For multiplication followed by unit conversion followed by character counting, use Calculator, then Converter, then String_Analyzer, then Writer.
-3. After String_Analyzer, choose Writer.
-4. Do not repeat a completed tool.
-5. Reply with exactly two lines:
-   first line: tool name from the list
-   second line: concise instruction for that tool
-"""
-    raw = invoke_text(llm, prompt)
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if len(lines) >= 2 and lines[0] in TOOL_NAMES:
-        return lines[0], "\n".join(lines[1:])
-
-    # Predictable fallback for common multi-step requests if model formatting is unexpected.
-    lower = question.lower()
-    if previous_tool == "String_Analyzer":
-        return "Writer", "Report the completed result."
-    if count == 0 and any(op in question for op in ("*", "×", "multiply", "multiplication")):
-        return "Calculator", "Extract and calculate the arithmetic expression from the user request."
-    if count == 1 and any(unit in lower for unit in ("centimeter", "centimetre", "kilometer", "kilometre", "meter", "metre")):
-        return "Converter", "Convert the previous numeric result to the requested target unit."
-    if count == 2 and any(word in lower for word in ("character", "digit", "length")):
-        return "String_Analyzer", "Count digits in the converted numeric value only."
-    return "Writer", "Summarize the available result without inventing values."
+    if count == 0 and has_arithmetic:
+        return "Calculator", "Calculate the arithmetic expression in the user's request."
+    if count == 1 and asks_conversion:
+        return "Converter", "Convert the calculator result to the requested unit."
+    if count == 2 and asks_count:
+        return "String_Analyzer", "Count digits in the converted numeric value."
+    return "Writer", "Present the completed result."
 
 
 # -----------------------------
@@ -166,16 +143,17 @@ def make_nodes(llm):
         return {"selected_tool": tool, "message": instruction, "steps": steps}
 
     def calculator_node(state: AgentState):
-        # Extract the expression from the original question rather than trusting
-        # an LLM-generated expression, to avoid accidental digit changes.
+        # Extract the complete arithmetic expression, e.g. 100*564+987.
         question = state["question"]
-        match = re.search(r"(-?\d[\d,]*(?:\.\d+)?)\s*([+*/%\-])\s*(-?\d[\d,]*(?:\.\d+)?)", question)
+        expression_pattern = (
+            r"(?<![\w.])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+            r"(?:\s*[+*/%\-]\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)+"
+        )
+        match = re.search(expression_pattern, question)
         if not match:
             raise ValueError("I couldn't find a supported arithmetic expression in your request.")
-        left = match.group(1).replace(",", "")
-        op = match.group(2)
-        right = match.group(3).replace(",", "")
-        expression = f"{left}{op}{right}"
+
+        expression = match.group(0).replace(",", "")
         result = safe_calculate(expression)
         result_text = format_number(result)
         steps = list(state.get("steps", []))
@@ -302,6 +280,9 @@ with st.form("agent_form"):
     submitted = st.form_submit_button("Run", type="primary")
 
 if submitted:
+    # Remove stale output so a failed run cannot display an old answer.
+    st.session_state.pop("last_result", None)
+    st.session_state.pop("last_question", None)
     llm = get_llm()
     if llm is None:
         st.error("GOOGLE_API_KEY was not found. Add it to your .env file and restart the app.")
